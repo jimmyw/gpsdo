@@ -5,6 +5,7 @@
 // plus, flashing LED connected to pin 10 indicates when enough sat's in view
 // u-blox module to connect o 3 and 4 for using soft serial of Arduino
 // CT2GQV 2019 mixing multiple libs and examples.
+#include "Arduino.h"
 
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
