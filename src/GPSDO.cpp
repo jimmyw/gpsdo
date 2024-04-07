@@ -72,7 +72,7 @@ const char UBLOX_INIT[] PROGMEM = {
 
 };
 
-int SATLED = PC13; // for showing we have statelites and in sync
+const int STATUS_LED = PC13; // for showing we have statelites and in sync
 int havefix = 0;   // to keep track if we have fix for at least 3 seconds
 float start_freq = 2000000000;
 
@@ -92,10 +92,10 @@ void setup()
     lcd.print("Booting...");    */
     ss.begin(9600);
 
-    pinMode(SATLED, OUTPUT); // to indicate we have enough satelites
-    digitalWrite(SATLED, HIGH);
+    pinMode(STATUS_LED, OUTPUT); // to indicate we have enough satelites
+    digitalWrite(STATUS_LED, LOW);
     delay(2000);
-    digitalWrite(SATLED, LOW);
+    digitalWrite(STATUS_LED, HIGH);
 
     // actual u-blox 7m programing
     for (int i = 0; i < sizeof(UBLOX_INIT); i++) {
@@ -162,7 +162,7 @@ void loop()
         // lcd.setCursor(0, 0); lcd.print("Satelites:");lcd.print(sats);
 
         if (sats >= 3) {                // we have sats in view, we should be good
-            digitalWrite(SATLED, HIGH); // delay(200);digitalWrite(SATLED, LOW );
+            digitalWrite(STATUS_LED, LOW); // delay(200);digitalWrite(STATUS_LED, LOW );
             havefix = 2;
             havefix++; // increments every time we have fix until 3, if we don't have fix/sats then after 3 cycles it will go zero and we shutt the indicator
                        // led.
@@ -177,7 +177,7 @@ void loop()
     if (havefix >= 1)
         havefix--; // we had allready 1 fix in the loop
     if (havefix == 0) {
-        digitalWrite(SATLED, LOW);
+        digitalWrite(STATUS_LED, HIGH);
     }; // we don't have fix so power off the fix LED
     Serial.print("MAIN_HAVE_FIX: ");
     Serial.println(havefix);
