@@ -5,13 +5,14 @@
 // plus, flashing LED connected to pin 10 indicates when enough sat's in view
 // u-blox module to connect o 3 and 4 for using soft serial of Arduino
 // CT2GQV 2019 mixing multiple libs and examples.
+
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
+#include <U8g2lib.h>
 
 #include "Arduino.h"
 #include "si5351.h"
 Si5351 si5351; // i2c 0x60
-// LiquidCrystal_I2C lcd(0x27,2,1,0,4,5,6,7);
 
 const char UBLOX_INIT[] PROGMEM = {
 
@@ -72,24 +73,72 @@ const char UBLOX_INIT[] PROGMEM = {
 
 };
 
+TwoWire wire2(PB11, PB10);
+// U8X8_SSD1306_128X32_UNIVISION_2ND_HW_I2C lcd;
+U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C lcd(U8G2_R0, PB10, PB11, U8X8_PIN_NONE);
+
 const int STATUS_LED = PC13; // for showing we have statelites and in sync
-int havefix = 0;   // to keep track if we have fix for at least 3 seconds
-float start_freq = 2000000000;
+int havefix = 0;             // to keep track if we have fix for at least 3 seconds
 
 TinyGPS gps;
-// SoftwareSerial ss(4, 3);
+
 SoftwareSerial ss(A3, A4);
 int sats = 0;
+float flat, flon;
+unsigned long age;
+
+// 1.000 Mhz, 10.000 Mhz, 14.000 Mhz
+const unsigned long long freq[3] = {100000000ULL, 1000000000ULL, 1400000000ULL};
+
+static void lcd_print(const char *str)
+{
+    lcd.clearBuffer();
+    lcd.setFont(u8g2_font_6x10_tf);
+    lcd.drawStr(0, 10, str);
+    lcd.sendBuffer();
+}
+
+static void lcd_status()
+{
+    lcd.clearBuffer();
+    char buf[64];
+
+    if (havefix) {
+        snprintf(buf, sizeof(buf), "PLL Locked.");
+    } else {
+        snprintf(buf, sizeof(buf), "No GPS Lock.");
+    }
+    lcd.drawStr(0, 10, buf);
+
+
+    snprintf(buf, sizeof(buf), "S:%d A:%ld", sats, age);
+    lcd.drawStr(0, 20, buf);
+
+    if (si5351.dev_status.SYS_INIT != 0 || si5351.dev_status.LOL_A != 0 || si5351.dev_status.LOL_B != 0 || si5351.dev_status.LOS != 0) {
+
+        snprintf(buf, sizeof(buf), "IN:%d LA:%d LB:%d LO:%d", si5351.dev_status.SYS_INIT, si5351.dev_status.LOL_A, si5351.dev_status.LOL_B,
+                 si5351.dev_status.LOS);
+        lcd.drawStr(0, 30, buf);
+    } else {
+
+        // Print freqs
+        snprintf(buf, sizeof(buf), "%ldMhz %ldMhz %ldMhz", (int)(freq[0] / 100000000ULL), (int)(freq[1] / 100000000ULL), (int)(freq[2] / 100000000ULL));
+        lcd.drawStr(0, 30, buf);
+    }
+    lcd.sendBuffer();
+}
 
 void setup()
 {
-    /*
-    lcd.begin(16, 2);                           // LCD set for 16 by 2 display
-    lcd.setBacklightPin(3,POSITIVE);            // (BL, BL_POL)
-    lcd.setBacklight(HIGH);                     // LCD backlight turned ON
+    // Configure i2c pins
+    Wire.setSCL(PB6);
+    Wire.setSDA(PB7);
 
-    lcd.setCursor(0, 0);                        //
-    lcd.print("Booting...");    */
+    wire2.begin();
+
+    // lcd.setI2CAddress(0x3D<<1);
+    lcd.begin();
+    lcd_print("Initializing GPS.");
     ss.begin(9600);
 
     pinMode(STATUS_LED, OUTPUT); // to indicate we have enough satelites
@@ -106,10 +155,9 @@ void setup()
 
     Serial.begin(9600);
     Serial.println("= sent init string to GPS =");
+    lcd_print("GPS Initialized.");
     /*lcd.setCursor(0, 0); lcd.print("NO DATA   ");*/
 
-    Wire.setSCL(PB6);
-    Wire.setSDA(PB7);
     bool i2c_found = 0;
     while (true) {
         i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_0PF, 24000000, 0);
@@ -122,14 +170,15 @@ void setup()
         // on the library Si5351/si5351.h chang it to 24Mhz
         // #define SI5351_XTAL_FREQ                                                25000000
         si5351.set_pll(SI5351_PLL_FIXED, SI5351_PLLA);
-        si5351.set_freq(100000000ULL, SI5351_CLK0);  //  1.000 Mhz for the marker
-        si5351.set_freq(1000000000ULL, SI5351_CLK1); // 10.000 Mhz for the ext 10Mhz of counter
-        si5351.set_freq(1400000000ULL, SI5351_CLK2); // 14Mhz
+        si5351.set_freq(freq[0], SI5351_CLK0); //  1.000 Mhz for the marker
+        si5351.set_freq(freq[1], SI5351_CLK1); // 10.000 Mhz for the ext 10Mhz of counter
+        si5351.set_freq(freq[2], SI5351_CLK2); // 14Mhz
 
         si5351.update_status();
         delay(500);
         break;
     }
+    lcd_print("Si5351 Initialized.");
 }
 
 void loop()
@@ -149,8 +198,6 @@ void loop()
     }
 
     if (newData) {
-        float flat, flon;
-        unsigned long age;
         gps.f_get_position(&flat, &flon, &age);
         Serial.print("LAT=");
         Serial.print(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6);
@@ -161,7 +208,7 @@ void loop()
         Serial.println(sats);
         // lcd.setCursor(0, 0); lcd.print("Satelites:");lcd.print(sats);
 
-        if (sats >= 3) {                // we have sats in view, we should be good
+        if (sats >= 3) {                   // we have sats in view, we should be good
             digitalWrite(STATUS_LED, LOW); // delay(200);digitalWrite(STATUS_LED, LOW );
             havefix = 2;
             havefix++; // increments every time we have fix until 3, if we don't have fix/sats then after 3 cycles it will go zero and we shutt the indicator
@@ -197,5 +244,7 @@ void loop()
     Serial.print(si5351.dev_status.LOS);
     Serial.print("  REVID: ");
     Serial.println(si5351.dev_status.REVID);
+
+    lcd_status();
 }
 //=end code==============
