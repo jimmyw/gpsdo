@@ -113,7 +113,7 @@ void setup()
   Wire.setSDA(PB7);
   bool i2c_found = 0;
   while (true) {
-    i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_0PF, 0, 0);
+    i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_0PF, 24000000, 0);
     if(!i2c_found)
     {
       Serial.println("Device not found on I2C bus!");
