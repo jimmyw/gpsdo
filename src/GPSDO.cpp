@@ -1,3 +1,6 @@
+
+#include <Arduino.h>
+
 // programing of the u-blox 7m module from Arduino for timepulse TP-5
 // hex was taken from u-center software configuration view
 //
@@ -6,245 +9,310 @@
 // u-blox module to connect o 3 and 4 for using soft serial of Arduino
 // CT2GQV 2019 mixing multiple libs and examples.
 
-#include <SoftwareSerial.h>
+#include "esp_log.h"
 #include <TinyGPS.h>
 #include <U8g2lib.h>
+#include <Wire.h>
+#include <stdint.h>
+#include <string.h>
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
-#include "Arduino.h"
-#include "si5351.h"
-Si5351 si5351; // i2c 0x60
+// https://content.u-blox.com/sites/default/files/products/documents/u-blox6_ReceiverDescrProtSpec_%28GPS.G6-SW-10018%29_Public.pdf
 
-const char UBLOX_INIT[] PROGMEM = {
+#define ACTIVE (1 << 0)
+#define LOCK_GPS_FREQS (1 << 1)
+#define LOCK_OTHER_SET (1 << 2)
+#define IS_REQ (1 << 3)
+#define IS_LENGTH (1 << 4)
+#define ALIGN_TO_TOW (1 << 5)
+#define POLARITY (1 << 6)
+#define GRID_UTC_GPS (1 << 7)
 
-    // the actual programing string, uncoment for the one needed. 10Mhz, 2.5Mhz, 24Mhz or 2Mhz
-    // any frequency not integer divide of 48Mhz will have some jitter since module reference is 48. Best use is for 24 or 2 Mhz
+#define TP5_SIZE 40
 
-    /*
-     // CFG-TP5 1Hz / 10Mhz sync
-      0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x96,
-      0x98, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x08, 0x00, 0x00, 0x7E, 0xA8,
-    */
+static void setMode();
 
-    /*
-      // CFG-TP5 1Hz / 10Mhz no sync 50ms cable delay
-      0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x96, 0x98, 0x00,
-      0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0xA8, 0x08,
-    */
-    /*
-      // CFG-TP5 1Hz / 24 Mhz no sync 0ms cable delay
-      0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x36, 0x6E, 0x01,
-      0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x6D, 0x8D,
-    */
+// Define the configuration struct
+typedef struct {
+  uint8_t tpIdx; // Timepulse selection (0 = TIMEPULSE, 1 = TIMEPULSE2)
+  uint8_t reserved0;
+  uint8_t reserved1[2];
+  int16_t antCableDelay; // Antenna cable delay (ns)
+  int16_t rfGroupDelay;  // RF group delay (ns)
+  uint32_t freqPeriod;   // Frequency or period time, depending on settingof bit
+                         // 'isFreq' (hz/us)
+  uint32_t freqPeriodLock; // Frequency or period time when locked to GPS time,
+                           // only used if 'lockedOtherSet' is set (hs/us)
+  uint32_t pulseLenRatio;  // Pulse length or duty cycle, depending on'isLength'
+                           // (us/-)
+  uint32_t
+      pulseLenRatioLock; // Pulse length or duty cycle when locked to GPS time,
+                         // only used if 'lockedOtherSet' is set (us/-)
+  int32_t userConfigDelay; // User configurable timepulse delay (ns)
+  uint32_t flags;
+} __attribute__((packed)) UBX_CFG_TP5_t;
 
-    // CFG-TP5 24MHz / 24 Mhz - allways outputing 24Mhz either in sync with GPS or not. LED on D10 will indicate GPS lock.
-    0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x6E, 0x01, 0x00, 0x36,
-    0x6E, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x11, 0xD8,
+// Function to generate UBlox CFG-TP5 message
+void generateUBloxCFGTP5(const UBX_CFG_TP5_t *config, uint8_t *message) {
+  // UBX header
+  message[0] = 0xB5; // Sync char 1
+  message[1] = 0x62; // Sync char 2
+  message[2] = 0x06; // Class
+  message[3] = 0x31; // ID
+  message[4] = 0x20; // Length LSB (32 bytes)
+  message[5] = 0x00; // Length MSB
 
-    /*
-      // CFG-TP5 1Hz / 2.5Mhz no sync 50ms cable delay
-      0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x25, 0x26, 0x00,
-      0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0xE5, 0x21,
-    */
+  assert(sizeof(*config) == 0x20);
 
-    /*
-      // CFG-TP5 1Hz / 2 Mhz no sync 50ms cable delay
-      0xB5, 0x62, 0x06, 0x31, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x84, 0x1E, 0x00,
-      0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x1C, 0x1E,
-    */
+  // Copy the configuration struct into the message payload
+  memcpy(&message[6], config, sizeof(UBX_CFG_TP5_t));
 
-    /*
-      // UBX-CFG-TP5
-      0xB5, 0x62, // header
-      0x06, 0x31, // time pulse get/set
-      0x20,  // lenght 32
-      0x00, // tpIdx time pulse selection = 0 = timepulse, 1 = timepulse2  (U1 Char)
-      0x00,  // reserved0 U1
-      0x01, 0x00, // reserved1 U2
-      0x00, 0x32, // antCableDelay ns
-      0x00, 0x00, // rf group delay I2
-      0x00, 0x90, 0xD0, 0x03, // freqPeriod
-      0x00, 0x40, 0x42, 0x0F, // freqPeriodLoc
-      0x00, 0xF0, 0x49, 0x02, // pulselenRatio
-      0x00, 0x60, 0xAE, 0x0A, // pulselenRatio
-      0x00, 0x00, 0x00, 0x00, // userConfigDelay ns
-      0x00, 0x77, 0x00, 0x00, // flags - page 135 u-blox 7 Receiver Description Including Protocol Specification V14.pdf
-      0x00, 0x48, 0x65,
-    */
+  // Calculate checksum
+  uint8_t ck_a = 0, ck_b = 0;
+  for (int i = 2; i < 38; i++) {
+    ck_a += message[i];
+    ck_b += ck_a;
+  }
 
+  // Append checksum to the message
+  message[38] = ck_a;
+  message[39] = ck_b;
+}
+
+struct mode_def {
+  const char *name;
+  const UBX_CFG_TP5_t value;
 };
 
-TwoWire wire2(PB11, PB10);
-// U8X8_SSD1306_128X32_UNIVISION_2ND_HW_I2C lcd;
-U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C lcd(U8G2_R0, PB10, PB11, U8X8_PIN_NONE);
+const struct mode_def timing_modes[] = {
 
-const int STATUS_LED = PC13; // for showing we have statelites and in sync
-int havefix = 0;             // to keep track if we have fix for at least 3 seconds
+    {.name = "1Hz",
+     .value =
+         {
+             .tpIdx = 0x00,
+             .reserved0 = 1,
+             .antCableDelay = 0x00,           // ns
+             .rfGroupDelay = 0x00,            // ns
+             .freqPeriod = 0,                 // disable
+             .freqPeriodLock = 1,             // 1 Hz (1,000,000 microseconds)
+             .pulseLenRatio = 0x80000000,     // 50% (500,000 in 0.01% units)
+             .pulseLenRatioLock = 0x80000000, // 50% (500,000 in 0.01% units)
+             .userConfigDelay = 0,            // ns
+             .flags = ACTIVE | LOCK_GPS_FREQS | LOCK_OTHER_SET | IS_REQ |
+                      ALIGN_TO_TOW | POLARITY, // Active high, disable if no fix
+         }},
+    {.name = "1kHz",
+     .value =
+         {
+             .tpIdx = 0x00,
+             .reserved0 = 1,
+             .antCableDelay = 0x00,           // ns
+             .rfGroupDelay = 0x00,            // ns
+             .freqPeriod = 0,                 // disable
+             .freqPeriodLock = 1000,          // 10 kHz
+             .pulseLenRatio = 0x80000000,     // 50% (500,000 in 0.01% units)
+             .pulseLenRatioLock = 0x80000000, // 50% (500,000 in 0.01% units)
+             .userConfigDelay = 0,            // ns
+             .flags = ACTIVE | LOCK_GPS_FREQS | LOCK_OTHER_SET | IS_REQ |
+                      ALIGN_TO_TOW | POLARITY, // Active high, disable if no fix
+         }
+
+    },
+    {.name = "1kHz",
+     .value =
+         {
+             .tpIdx = 0x00,
+             .reserved0 = 1,
+             .antCableDelay = 0x00,           // ns
+             .rfGroupDelay = 0x00,            // ns
+             .freqPeriod = 0,                 // disable
+             .freqPeriodLock = 10000,         // 10 KHz
+             .pulseLenRatio = 0x80000000,     // 50% (500,000 in 0.01% units)
+             .pulseLenRatioLock = 0x80000000, // 50% (500,000 in 0.01% units)
+             .userConfigDelay = 0,            // ns
+             .flags = ACTIVE | LOCK_GPS_FREQS | LOCK_OTHER_SET | IS_REQ |
+                      ALIGN_TO_TOW | POLARITY, // Active high, disable if no fix
+         }
+
+    },
+    {.name = "1Mhz",
+     .value =
+         {
+             .tpIdx = 0x00,
+             .reserved0 = 1,
+             .antCableDelay = 0x00,           // ns
+             .rfGroupDelay = 0x00,            // ns
+             .freqPeriod = 0,                 // disable
+             .freqPeriodLock = 1000000,       // 1 Mhz
+             .pulseLenRatio = 0x80000000,     // 50% (500,000 in 0.01% units)
+             .pulseLenRatioLock = 0x80000000, // 50% (500,000 in 0.01% units)
+             .userConfigDelay = 0,            // ns
+             .flags = ACTIVE | LOCK_GPS_FREQS | LOCK_OTHER_SET | IS_REQ |
+                      ALIGN_TO_TOW | POLARITY, // Active high, disable if no fix
+         }
+
+    },
+    {.name = "10Mhz",
+     .value =
+         {
+             .tpIdx = 0x00,
+             .reserved0 = 1,
+             .antCableDelay = 0x00,           // ns
+             .rfGroupDelay = 0x00,            // ns
+             .freqPeriod = 0,                 // disable
+             .freqPeriodLock = 10000000,      // 10 Mhz
+             .pulseLenRatio = 0x80000000,     // 50% (500,000 in 0.01% units)
+             .pulseLenRatioLock = 0x80000000, // 50% (500,000 in 0.01% units)
+             .userConfigDelay = 0,            // ns
+             .flags = ACTIVE | LOCK_GPS_FREQS | LOCK_OTHER_SET | IS_REQ |
+                      ALIGN_TO_TOW | POLARITY, // Active high, disable if no fix
+         }},
+};
+
+int havefix = 0; // to keep track if we have fix for at least 3 seconds
 
 TinyGPS gps;
+HardwareSerial ss(1);
 
-SoftwareSerial ss(A3, A4);
-int sats = 0;
-float flat, flon;
-unsigned long age;
+static float flat = 0;
+unsigned long age = 0;
+static float flon = 0;
+static int sats = 0;
+static int mode_idx = 0;
 
-// 1.000 Mhz, 10.000 Mhz, 14.000 Mhz
-const unsigned long long freq[3] = {100000000ULL, 1000000000ULL, 1400000000ULL};
+#define LCD_SCL 2
+#define LCD_SDA 3
+#define GPS_RX 7
+#define GPS_TX 10
+#define BUTTON 9
 
-static void lcd_print(const char *str)
-{
-    lcd.clearBuffer();
-    lcd.setFont(u8g2_font_6x10_tf);
-    lcd.drawStr(0, 10, str);
-    lcd.sendBuffer();
+// U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C(const u8g2_cb_t *rotation, uint8_t
+// reset = U8X8_PIN_NONE, uint8_t clock = U8X8_PIN_NONE, uint8_t data =
+// U8X8_PIN_NONE)
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(/* rotation =*/U8G2_R0,
+                                         /* reset=*/U8X8_PIN_NONE,
+                                         /* clock=*/LCD_SCL,
+                                         /* data=*/LCD_SDA);
+
+void setup() {
+  //Serial.begin(115200);
+  Serial.println("= GPSDO =");
+  pinMode(BUTTON, INPUT);
+
+  u8g2.setBusClock(100000);
+  // u8g2.setI2CAddress(0x3C);
+  u8g2.begin();
+  u8g2.setPowerSave(0);
+
+  u8g2.firstPage(); // Start the first page
+  do {
+    u8g2.setFont(u8g2_font_ncenB08_tr); // Set font
+    u8g2.setCursor(0, 10);              // Set cursor position
+    u8g2.print("Hello, World!");        // Print message
+  } while (u8g2.nextPage());            // Continue to the next page
+
+  ss.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX); // RX, TX
+
+  setMode();
 }
 
-static void lcd_status()
-{
-    lcd.clearBuffer();
-    char buf[64];
+static void setMode() {
+  const struct mode_def *mode = &timing_modes[mode_idx];
+  uint8_t message[TP5_SIZE];
+  generateUBloxCFGTP5(&mode->value, message);
 
-    if (havefix) {
-        snprintf(buf, sizeof(buf), "PLL Locked.");
-    } else {
-        snprintf(buf, sizeof(buf), "No GPS Lock.");
-    }
-    lcd.drawStr(0, 10, buf);
-
-
-    snprintf(buf, sizeof(buf), "S:%d A:%ld", sats, age);
-    lcd.drawStr(0, 20, buf);
-
-    if (si5351.dev_status.SYS_INIT != 0 || si5351.dev_status.LOL_A != 0 || si5351.dev_status.LOL_B != 0 || si5351.dev_status.LOS != 0) {
-
-        snprintf(buf, sizeof(buf), "IN:%d LA:%d LB:%d LO:%d", si5351.dev_status.SYS_INIT, si5351.dev_status.LOL_A, si5351.dev_status.LOL_B,
-                 si5351.dev_status.LOS);
-        lcd.drawStr(0, 30, buf);
-    } else {
-
-        // Print freqs
-        snprintf(buf, sizeof(buf), "%ldMhz %ldMhz %ldMhz", (int)(freq[0] / 100000000ULL), (int)(freq[1] / 100000000ULL), (int)(freq[2] / 100000000ULL));
-        lcd.drawStr(0, 30, buf);
-    }
-    lcd.sendBuffer();
+  // actual u-blox 7m programing
+  for (int i = 0; i < sizeof(message); i++) {
+    ss.write(message[i]);
+    Serial.print("0x");
+    Serial.println(message[i], HEX);
+    delay(5); // simulating a 38400baud pace (or less), otherwise commands are
+              // not accepted by the device.
+  }
+  Serial.println();
+  // ends here
 }
 
-void setup()
-{
-    // Configure i2c pins
-    Wire.setSCL(PB6);
-    Wire.setSDA(PB7);
+void loop() {
+  bool newData = false;
+  unsigned long chars;
+  unsigned short sentences, failed;
 
-    wire2.begin();
-
-    // lcd.setI2CAddress(0x3D<<1);
-    lcd.begin();
-    lcd_print("Initializing GPS.");
-    ss.begin(9600);
-
-    pinMode(STATUS_LED, OUTPUT); // to indicate we have enough satelites
-    digitalWrite(STATUS_LED, LOW);
-    delay(2000);
-    digitalWrite(STATUS_LED, HIGH);
-
-    // actual u-blox 7m programing
-    for (int i = 0; i < sizeof(UBLOX_INIT); i++) {
-        ss.write(pgm_read_byte(UBLOX_INIT + i));
-        delay(5); // simulating a 38400baud pace (or less), otherwise commands are not accepted by the device.
+  // For one second we parse GPS data and report some key values
+  for (unsigned long start = millis(); millis() - start < 100;) {
+    while (ss.available()) {
+      char c = ss.read();
+      // Serial.write(
+      //     c); // uncomment this line if you want to see the GPS data flowing
+      if (gps.encode(c)) // Did a new valid sentence come in?
+        newData = true;
     }
-    // ends here
+  }
 
-    Serial.begin(9600);
-    Serial.println("= sent init string to GPS =");
-    lcd_print("GPS Initialized.");
-    /*lcd.setCursor(0, 0); lcd.print("NO DATA   ");*/
+  if (newData) {
+    gps.f_get_position(&flat, &flon, &age);
+    sats = gps.satellites();
+    havefix = age < 3000 ? 1 : 0; // if we have fix for at least 3 seconds
 
-    bool i2c_found = 0;
-    while (true) {
-        i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_0PF, 24000000, 0);
-        if (!i2c_found) {
-            Serial.println("Device not found on I2C bus!");
-            delay(1000);
-            continue;
-        }
 
-        // on the library Si5351/si5351.h chang it to 24Mhz
-        // #define SI5351_XTAL_FREQ                                                25000000
-        si5351.set_pll(SI5351_PLL_FIXED, SI5351_PLLA);
-        si5351.set_freq(freq[0], SI5351_CLK0); //  1.000 Mhz for the marker
-        si5351.set_freq(freq[1], SI5351_CLK1); // 10.000 Mhz for the ext 10Mhz of counter
-        si5351.set_freq(freq[2], SI5351_CLK2); // 14Mhz
-
-        si5351.update_status();
-        delay(500);
-        break;
-    }
-    lcd_print("Si5351 Initialized.");
-}
-
-void loop()
-{
-    bool newData = false;
-    unsigned long chars;
-    unsigned short sentences, failed;
-
-    // For one second we parse GPS data and report some key values
-    for (unsigned long start = millis(); millis() - start < 1000;) {
-        while (ss.available()) {
-            char c = ss.read();
-            Serial.write(c);   // uncomment this line if you want to see the GPS data flowing
-            if (gps.encode(c)) // Did a new valid sentence come in?
-                newData = true;
-        }
-    }
-
-    if (newData) {
-        gps.f_get_position(&flat, &flon, &age);
-        Serial.print("LAT=");
-        Serial.print(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6);
-        Serial.print(" LON=");
-        Serial.print(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
-        Serial.print(" SAT=");
-        sats = gps.satellites();
-        Serial.println(sats);
-        // lcd.setCursor(0, 0); lcd.print("Satelites:");lcd.print(sats);
-
-        if (sats >= 3) {                   // we have sats in view, we should be good
-            digitalWrite(STATUS_LED, LOW); // delay(200);digitalWrite(STATUS_LED, LOW );
-            havefix = 2;
-            havefix++; // increments every time we have fix until 3, if we don't have fix/sats then after 3 cycles it will go zero and we shutt the indicator
-                       // led.
-            if (havefix >= 3)
-                havefix = 3; // never goes over 3
-            Serial.println();
-            Serial.print("SAT_HAVE_FIX: ");
-            Serial.println(havefix);
-        };
-    } // end new data
-
-    if (havefix >= 1)
-        havefix--; // we had allready 1 fix in the loop
-    if (havefix == 0) {
-        digitalWrite(STATUS_LED, HIGH);
-    }; // we don't have fix so power off the fix LED
-    Serial.print("MAIN_HAVE_FIX: ");
+    Serial.print("LAT=");
+    Serial.print(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6);
+    Serial.print(" LON=");
+    Serial.print(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
+    Serial.print(" SAT=");
+    Serial.print(sats);
+    Serial.print(" AGE=");
+    Serial.print(age);
+    Serial.print(" FIX=");
     Serial.println(havefix);
+  } // end new data
 
-    gps.stats(&chars, &sentences, &failed);
-    if (chars == 0)
-        Serial.println("** No characters received from GPS: check wiring **");
+  gps.stats(&chars, &sentences, &failed);
+  if (chars == 0) {
+    Serial.println("** No characters received from GPS: check wiring **");
+  }
 
-    si5351.update_status();
-    Serial.print("  SYS_INIT: ");
-    Serial.print(si5351.dev_status.SYS_INIT);
-    Serial.print("  LOL_A: ");
-    Serial.print(si5351.dev_status.LOL_A);
-    Serial.print("  LOL_B: ");
-    Serial.print(si5351.dev_status.LOL_B);
-    Serial.print("  LOS: ");
-    Serial.print(si5351.dev_status.LOS);
-    Serial.print("  REVID: ");
-    Serial.println(si5351.dev_status.REVID);
+  // Use button to switch modes
+  {
+    static volatile bool lastState = HIGH;
+    bool currentState = digitalRead(BUTTON);
+    if (lastState == HIGH && currentState == LOW) {
+      // Reset the setpoint to 350 degrees
+      mode_idx++;
+      mode_idx = mode_idx % ARRAY_SIZE(timing_modes);
+      Serial.print("Button pressed, new mode: ");
+      Serial.println(mode_idx);
 
-    lcd_status();
+      setMode();
+    }
+    lastState = currentState;
+  }
+
+  // Update LCD
+  u8g2.firstPage();
+  do {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenR08_tr);
+    u8g2.setCursor(0, 10);
+    u8g2.print("Satelites:");
+    u8g2.print(sats);
+    if (havefix)
+      u8g2.print(" FIX");
+    else
+      u8g2.print(" NO FIX");
+    u8g2.setCursor(0, 20);
+    u8g2.print("LAT:");
+    u8g2.print(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6);
+    u8g2.setCursor(0, 30);
+    u8g2.print("LON:");
+    u8g2.print(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
+
+    u8g2.setCursor(0, 40);
+    const struct mode_def *mode = &timing_modes[mode_idx];
+    u8g2.println(mode->name);
+    u8g2.sendBuffer();
+  } while (u8g2.nextPage());
+
 }
 //=end code==============
